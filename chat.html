@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>聊天</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="chat-app" id="chatApp">
+
+  <!-- 顶部：返回 + 对方昵称 -->
+  <header class="chat-header">
+    <a class="back-btn" href="index.html" aria-label="返回主页">←</a>
+    <span class="chat-title" id="chatTitle"></span>
+    <button class="card-entry" id="cardEntry" type="button">✎ 回答</button>
+  </header>
+
+  <!-- 聊天记录（仅当前会话有效，刷新即清空） -->
+  <main class="chat-messages" id="messages"></main>
+
+  <!-- 底部输入栏 -->
+  <footer class="chat-input-bar">
+    <input type="text" id="chatInput" autocomplete="off" maxlength="500">
+    <button id="sendBtn"></button>
+  </footer>
+
+  <!-- 添加回答面板 -->
+  <div class="card-panel-mask hide" id="cardPanelMask">
+    <div class="card-panel">
+      <div class="card-panel-head">
+        <span class="card-panel-title">🍓 秦梧的回答</span>
+        <button class="card-panel-close" id="cardPanelClose" type="button">✕</button>
+      </div>
+      <div class="card-panel-tip">在这里写下你想让他说的话，添加后会和他内置的回答混在一起，聊天时随机回复。每行一条，仅保存在当前浏览器。</div>
+      <div class="card-field">
+        <label for="cardReplies">回答（每行一条）</label>
+        <textarea id="cardReplies" placeholder="好呀，分你一半草莓～&#10;明天买给你！"></textarea>
+      </div>
+      <button class="card-add-btn" id="cardAddBtn" type="button">＋ 添加回答</button>
+      <div class="card-list" id="cardList"></div>
+    </div>
+  </div>
+  <div class="card-toast" id="cardToast"></div>
+</div>
+
+<script src="config.js"></script>
+<script>
+(function () {
+  var g = SITE_CONFIG.global;
+  var c = SITE_CONFIG.chat;
+
+  /* 应用全局配色与气泡颜色 */
+  var root = document.documentElement;
+  root.style.setProperty('--grad-from', g.gradientFrom);
+  root.style.setProperty('--grad-to', g.gradientTo);
+  root.style.setProperty('--text-color', g.textColor);
+  root.style.setProperty('--partner-bubble', c.partnerBubbleColor);
+  root.style.setProperty('--partner-bubble-text', c.partnerBubbleTextColor);
+  root.style.setProperty('--user-bubble', c.userBubbleColor);
+  root.style.setProperty('--user-bubble-text', c.userBubbleTextColor);
+  document.title = g.siteTitle + ' · ' + c.pageTitle;
+
+  /* 顶部与输入栏文案 */
+  document.getElementById('chatTitle').textContent = c.partnerName;
+  var input = document.getElementById('chatInput');
+  input.placeholder = c.inputPlaceholder;
+  document.getElementById('sendBtn').textContent = c.sendButtonText;
+
+  var msgBox = document.getElementById('messages');
+  var sendBtn = document.getElementById('sendBtn');
+  var waiting = false; // 是否正在等待对方回复
+
+  /* ---------- 消息渲染 ---------- */
+  function addMessage(who, text) {
+    var msg = document.createElement('div');
+    msg.className = 'msg ' + who;
+
+    var avatar = document.createElement('div');
+    avatar.className = 'avatar';
+    if (who === 'partner') {
+      avatar.style.background = c.partnerAvatarColor;
+      avatar.textContent = c.partnerAvatarText;
+    } else {
+      avatar.style.background = c.userAvatarColor;
+      avatar.textContent = c.userAvatarText;
+    }
+
+    var bubble = document.createElement('div');
+    bubble.className = 'bubble';
+    bubble.textContent = text; // textContent 防注入
+
+    msg.appendChild(avatar);
+    msg.appendChild(bubble);
+    msgBox.appendChild(msg);
+    scrollToBottom();
+    return msg;
+  }
+
+  function addTyping() {
+    var msg = document.createElement('div');
+    msg.className = 'msg partner';
+    msg.id = 'typingMsg';
+    msg.innerHTML =
+      '<div class="avatar" style="background:' + c.partnerAvatarColor + '">' + escapeHtml(c.partnerAvatarText) + '</div>' +
+      '<div class="bubble"><span class="typing-dots"><i></i><i></i><i></i></span></div>';
+    msgBox.appendChild(msg);
+    scrollToBottom();
+  }
+
+  function removeTyping() {
+    var t = document.getElementById('typingMsg');
+    if (t && t.parentNode) t.parentNode.removeChild(t);
+  }
+
+  function scrollToBottom() {
+    requestAnimationFrame(function () {
+      msgBox.scrollTop = msgBox.scrollHeight;
+    });
+  }
+
+  /* ---------- 自定义回答（localStorage 持久化） ---------- */
+  var REPLY_KEY = 'tutu_replies_v1';
+  function loadReplies() {
+    try {
+      var raw = JSON.parse(localStorage.getItem(REPLY_KEY));
+      if (Array.isArray(raw)) {
+        return raw.filter(function (x) { return typeof x === 'string'; });
+      }
+    } catch (e) {}
+    return [];
+  }
+  function saveReplies(list) {
+    try { localStorage.setItem(REPLY_KEY, JSON.stringify(list)); } catch (e) {}
+  }
+  /* 在规则列表中匹配关键词，命中则随机抽取一条回复 */
+  function pickFromRules(ruleList, lower) {
+    for (var i = 0; i < (ruleList || []).length; i++) {
+      var rule = ruleList[i];
+      var hit = (rule.keywords || []).some(function (kw) {
+        return kw && lower.indexOf(String(kw).toLowerCase()) !== -1;
+      });
+      if (hit && rule.replies && rule.replies.length) {
+        return rule.replies[Math.floor(Math.random() * rule.replies.length)];
+      }
+    }
+    return null;
+  }
+
+  /* ---------- 回复抽取逻辑 ---------- */
+  function pickReply(userText) {
+    var lower = String(userText).toLowerCase();
+    // 1. 内置关键词规则（原有功能，保留）
+    var builtin = pickFromRules(c.keywordRules, lower);
+    if (builtin) return builtin;
+    // 2. 随机回答池 = 内置随机回答 + 用户自定义回答，全部平级随机抽取
+    var pool = (c.randomReplies || []).concat(loadReplies());
+    if (!pool.length) return '……';
+    return pool[Math.floor(Math.random() * pool.length)];
+  }
+
+  /* ---------- 发送 ---------- */
+  function send() {
+    var text = input.value.trim();
+    if (!text || waiting) return;
+    input.value = '';
+    addMessage('user', text);
+    waiting = true;
+    sendBtn.disabled = true;
+    sendBtn.style.opacity = '.6';
+
+    var delay = Number(c.replyDelayMs) || 1000;
+    setTimeout(function () {
+      addTyping();
+    }, Math.max(0, delay - 700));
+
+    setTimeout(function () {
+      removeTyping();
+      addMessage('partner', pickReply(text));
+      waiting = false;
+      sendBtn.disabled = false;
+      sendBtn.style.opacity = '1';
+    }, delay);
+  }
+
+  sendBtn.addEventListener('click', send);
+  input.addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') send();
+  });
+
+  /* ---------- 添加回答面板交互 ---------- */
+  var panelMask = document.getElementById('cardPanelMask');
+  function openPanel() { renderList(); panelMask.classList.remove('hide'); }
+  function closePanel() { panelMask.classList.add('hide'); }
+  document.getElementById('cardEntry').addEventListener('click', openPanel);
+  document.getElementById('cardPanelClose').addEventListener('click', closePanel);
+  panelMask.addEventListener('click', function (e) {
+    if (e.target === panelMask) closePanel();
+  });
+
+  function toast(text) {
+    var el = document.getElementById('cardToast');
+    el.textContent = text;
+    el.classList.add('show');
+    clearTimeout(el._t);
+    el._t = setTimeout(function () { el.classList.remove('show'); }, 1600);
+  }
+
+  document.getElementById('cardAddBtn').addEventListener('click', function () {
+    var reps = document.getElementById('cardReplies').value
+      .split('\n').map(function (s) { return s.trim(); }).filter(Boolean);
+    if (!reps.length) { toast('请至少写一条回答'); return; }
+    var list = loadReplies().concat(reps);
+    saveReplies(list);
+    document.getElementById('cardReplies').value = '';
+    renderList();
+    toast('回答已添加 🍓');
+  });
+
+  function renderList() {
+    var list = loadReplies();
+    var box = document.getElementById('cardList');
+    box.innerHTML = '';
+    if (!list.length) {
+      var empty = document.createElement('div');
+      empty.className = 'card-empty';
+      empty.textContent = '还没有添加回答，写一句吧～';
+      box.appendChild(empty);
+      return;
+    }
+    list.forEach(function (text, idx) {
+      var item = document.createElement('div');
+      item.className = 'card-item';
+
+      var rep = document.createElement('span');
+      rep.className = 'card-item-rep';
+      rep.textContent = text;
+
+      var del = document.createElement('button');
+      del.className = 'card-item-del';
+      del.type = 'button';
+      del.textContent = '删除';
+      del.addEventListener('click', function () {
+        var arr = loadReplies();
+        arr.splice(idx, 1);
+        saveReplies(arr);
+        renderList();
+        toast('已删除这条回答');
+      });
+
+      item.appendChild(rep);
+      item.appendChild(del);
+      box.appendChild(item);
+    });
+  }
+
+  function escapeHtml(str) {
+    return String(str == null ? '' : str)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+  }
+})();
+</script>
+</body>
+</html>
